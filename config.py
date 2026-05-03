@@ -64,6 +64,11 @@ class Config:
     transformer_layers: int = 4
     transformer_ff_dim: int = 512
 
+    # HyperLSTM 配置
+    hyper_hidden_size: int = 64  # 超网络隐藏层维度
+    hyper_embedding_size: int = 16  # 超网络嵌入维度
+    use_layer_norm: bool = True  # 是否在 HyperLSTM 中使用层归一化
+
     # 多模态融合
     fusion_method: str = 'concatenate'  # 'concatenate', 'attention', 'cross_attention'
 
@@ -125,10 +130,6 @@ class Config:
             self.classification_type = self.task_type
         elif hasattr(self, 'classification_type'):
             self.task_type = self.classification_type
-
-        # 创建目录
-        for dir_path in [self.save_dir, self.log_dir, self.result_dir, self.figure_dir]:
-            os.makedirs(dir_path, exist_ok=True)
 
         print(f"配置初始化完成: 特征维度={self.feature_dim}, 任务类型={self.task_type}, 设备={self.device}")
 

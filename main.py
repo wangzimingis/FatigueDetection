@@ -1,14 +1,15 @@
-#main.py
+# main.py
 import argparse
 import sys
 import os
 import numpy as np
 import torch
+import datetime
+
 from config import Config
+
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-# main.py 开头添加
-
 
 from src.data_loader import (
     SEEDVIGDataset,
@@ -23,86 +24,10 @@ from src.feature_analyzer import (
 )
 from src.models import create_model, MultiModalFatigueModel
 from src.trainer import FatigueTrainer, cross_validation_training, hyperparameter_tuning
-from src.utils import set_seed, check_gpu, plot_model_architecture
+from src.utils import set_seed, check_gpu, plot_model_architecture, setup_chinese_font
 
-# main.py 文件开头添加以下代码
-import matplotlib
-import matplotlib.font_manager as fm
-import os
-import platform
-
-# 根据操作系统设置中文字体
-system = platform.system()
-if system == 'Windows':
-    # Windows系统：使用微软雅黑
-    font_paths = [
-        'C:/Windows/Fonts/msyh.ttc',  # 微软雅黑
-        'C:/Windows/Fonts/msyhbd.ttc',  # 微软雅黑粗体
-        'C:/Windows/Fonts/simhei.ttf',  # 黑体
-        'C:/Windows/Fonts/simsun.ttc',  # 宋体
-    ]
-elif system == 'Darwin':  # macOS
-    # macOS系统：使用苹方
-    font_paths = [
-        '/System/Library/Fonts/PingFang.ttc',
-        '/System/Library/Fonts/STHeiti Medium.ttc',
-        '/Library/Fonts/Microsoft/msyh.ttf',
-    ]
-else:  # Linux
-    # Linux系统
-    font_paths = [
-        '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
-        '/usr/share/fonts/truetype/arphic/uming.ttc',
-    ]
-
-# 尝试添加中文字体
-font_added = False
-for font_path in font_paths:
-    if os.path.exists(font_path):
-        try:
-            # 添加字体到Matplotlib
-            fm.fontManager.addfont(font_path)
-            font_name = fm.FontProperties(fname=font_path).get_name()
-            matplotlib.rcParams['font.sans-serif'] = [font_name]
-            matplotlib.rcParams['axes.unicode_minus'] = False
-            print(f"✅ 已设置中文字体: {font_name}")
-            font_added = True
-            break
-        except Exception as e:
-            print(f"⚠️  加载字体失败 {font_path}: {e}")
-
-# 如果没找到系统字体，使用下载的字体
-if not font_added:
-    try:
-        # 下载思源黑体作为备选
-        import urllib.request
-        import tempfile
-
-        print("正在下载中文字体...")
-        font_url = "https://github.com/adobe-fonts/source-han-sans/raw/release/OTF/SimplifiedChinese/SourceHanSansSC-Regular.otf"
-        temp_dir = tempfile.gettempdir()
-        local_font_path = os.path.join(temp_dir, "SourceHanSansSC-Regular.otf")
-
-        if not os.path.exists(local_font_path):
-            urllib.request.urlretrieve(font_url, local_font_path)
-
-        fm.fontManager.addfont(local_font_path)
-        font_name = fm.FontProperties(fname=local_font_path).get_name()
-        matplotlib.rcParams['font.sans-serif'] = [font_name]
-        matplotlib.rcParams['axes.unicode_minus'] = False
-        print(f"✅ 已使用下载字体: {font_name}")
-    except Exception as e:
-        print(f"❌ 无法设置中文字体: {e}")
-        print("将使用默认英文字体，中文显示为方框")
-
-# 设置Matplotlib默认参数
-matplotlib.rcParams.update({
-    'figure.figsize': (10, 6),
-    'figure.dpi': 100,
-    'savefig.dpi': 300,
-    'savefig.bbox': 'tight',
-    'savefig.pad_inches': 0.1,
-})
+# 初始化中文字体（使用完整版配置）
+setup_chinese_font()
 
 
 def parse_arguments():
@@ -138,7 +63,7 @@ def parse_arguments():
 
     # 模型参数
     parser.add_argument('--model_type', type=str, default='multimodal_transformer',
-                        choices=['cnn', 'multimodal_cnn_lstm', 'multimodal_transformer'],
+                        choices=['cnn', 'multimodal_cnn_lstm', 'multimodal_transformer', 'hyperlstm'],
                         help='模型类型')
     parser.add_argument('--fusion_method', type=str, default='cross_attention',
                         choices=['concatenate', 'attention', 'cross_attention'],
@@ -185,10 +110,8 @@ def setup_experiment(args):
     print("驾驶疲劳评估系统 - 实验设置")
     print("=" * 70)
 
-    # 创建配置
     config = Config()
 
-    # 更新配置
     config.data_root = args.data_root
     config.feature_type = args.feature_type
     config.use_eog = args.use_eog
@@ -201,16 +124,13 @@ def setup_experiment(args):
     config.learning_rate = args.learning_rate
     config.seed = args.seed
 
-    # 调试模式
     if args.debug:
         config.epochs = 5
         config.batch_size = 16
         print("调试模式：减少训练轮数和批大小")
 
-    # 设置随机种子
     set_seed(config.seed)
 
-    # 检查GPU
     gpu_info = check_gpu()
     print(f"设备: {config.device}")
     if gpu_info['available']:
@@ -218,7 +138,6 @@ def setup_experiment(args):
     else:
         print("警告：未检测到GPU，将使用CPU训练")
 
-    # 创建实验目录
     experiment_dir = f"./experiments/{args.experiment_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     config.save_dir = os.path.join(experiment_dir, 'checkpoints')
     config.log_dir = os.path.join(experiment_dir, 'logs')
@@ -239,10 +158,7 @@ def setup_experiment(args):
 
 
 def main():
-    """主函数"""
     args = parse_arguments()
-
-    # 设置实验
     config = setup_experiment(args)
 
     # 特征分析
@@ -250,62 +166,24 @@ def main():
         print("\n" + "=" * 70)
         print("特征分析")
         print("=" * 70)
-
-        # 创建数据集
-        dataset = SEEDVIGDataset(
-            config=config,
-            subject_ids=[1],  # 使用第一个被试者进行分析
-            mode='train'
-        )
-
-        # 特征提取和分析
+        dataset = SEEDVIGDataset(config, subject_ids=[1], mode='train')
         if args.analyze_features:
             features, labels = analyze_dataset_statistics(dataset, config)
-
-        # 可视化特征
         if args.visualize_features:
             visualizer = FeatureVisualizer()
-
-            # 随机选择一些样本进行可视化
             sample_indices = np.random.choice(len(dataset), min(50, len(dataset)), replace=False)
             sample_data = []
             sample_labels = []
-
             for idx in sample_indices:
                 sample = dataset[idx]
                 sample_data.append(sample['eeg'].numpy())
                 sample_labels.append(sample['label'].numpy())
-
             sample_data = np.array(sample_data)
             sample_labels = np.concatenate(sample_labels)
-
-            # 时域特征可视化
-            visualizer.plot_time_domain_features(
-                sample_data,
-                sample_labels,
-                save_path=f"{config.figure_dir}/time_domain_features.png"
-            )
-
-            # 频域特征可视化
-            visualizer.plot_frequency_domain_features(
-                sample_data,
-                sample_labels,
-                save_path=f"{config.figure_dir}/frequency_domain_features.png"
-            )
-
-            # 空域特征可视化
-            visualizer.plot_spatial_features(
-                sample_data[0],  # 第一个样本
-                save_path=f"{config.figure_dir}/spatial_features.png"
-            )
-
-            # 疲劳相关分析
-            visualizer.plot_fatigue_analysis(
-                sample_data,
-                sample_labels,
-                save_path=f"{config.figure_dir}/fatigue_analysis.png"
-            )
-
+            visualizer.plot_time_domain_features(sample_data, sample_labels, save_path=f"{config.figure_dir}/time_domain_features.png")
+            visualizer.plot_frequency_domain_features(sample_data, sample_labels, save_path=f"{config.figure_dir}/frequency_domain_features.png")
+            visualizer.plot_spatial_features(sample_data[0], save_path=f"{config.figure_dir}/spatial_features.png")
+            visualizer.plot_fatigue_analysis(sample_data, sample_labels, save_path=f"{config.figure_dir}/fatigue_analysis.png")
             print(f"特征可视化已保存到: {config.figure_dir}")
 
     # 模型训练
@@ -315,62 +193,34 @@ def main():
         print("=" * 70)
 
         if args.cross_validation:
-            # 交叉验证训练
             print("使用交叉验证训练...")
-            avg_metrics = cross_validation_training(
-                config=config,
-                subject_ids=args.subject_ids,
-                n_folds=config.n_folds
-            )
-
-            print(
-                f"\n交叉验证完成！平均主要指标: {avg_metrics['main_metric']['mean']:.4f} ± {avg_metrics['main_metric']['std']:.4f}")
-
+            avg_metrics = cross_validation_training(config, subject_ids=args.subject_ids, n_folds=config.n_folds)
+            print(f"\n交叉验证完成！平均主要指标: {avg_metrics['main_metric']['mean']:.4f} ± {avg_metrics['main_metric']['std']:.4f}")
         else:
-            # 常规训练
-            # 创建数据加载器
-            train_loader, val_loader = create_dataloaders(
-                config=config,
-                subject_ids=args.subject_ids,
-                batch_size=config.batch_size
-            )
-
+            train_loader, val_loader = create_dataloaders(config, subject_ids=args.subject_ids, batch_size=config.batch_size)
             print(f"训练集: {len(train_loader.dataset)} 个样本")
             print(f"验证集: {len(val_loader.dataset)} 个样本")
-
-            # 创建模型
             model = create_model(config)
-
-            # 可视化模型结构
             plot_model_architecture(model, config, save_path=f"{config.figure_dir}/model_architecture.png")
-
-            # 训练模型
             trainer = FatigueTrainer(model, config)
             best_metric = trainer.train(train_loader, val_loader)
-
             print(f"\n训练完成！最佳指标: {best_metric:.4f}")
-
-            # 评估模型
             val_metrics = trainer.evaluate(val_loader)
-
-            # 保存最终模型
             trainer.save_checkpoint('final_model.pth')
+            #trainer.save_metrics_report(val_loader, os.path.join(config.result_dir, 'metrics_report.xlsx'))
 
     # 超参数调优
     if args.hyperparameter_tuning:
         print("\n" + "=" * 70)
         print("超参数调优")
         print("=" * 70)
-
         param_grid = {
             'learning_rate': [1e-3, 1e-4, 5e-4],
             'batch_size': [16, 32, 64],
             'dropout_rate': [0.3, 0.5, 0.7],
             'cnn_channels': [[32, 64, 128], [64, 128, 256]],
         }
-
         best_params, best_score = hyperparameter_tuning(config, param_grid)
-
         print(f"最佳超参数: {best_params}")
         print(f"最佳得分: {best_score}")
 
@@ -379,41 +229,18 @@ def main():
         print("\n" + "=" * 70)
         print("模型评估")
         print("=" * 70)
-
-        # 加载模型
         checkpoint = torch.load(args.model_path, map_location=config.device)
-
-        # 重建配置
         eval_config = Config.from_dict(checkpoint['config'])
         eval_config.device = config.device
-
-        # 创建模型
         model = create_model(eval_config)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.to(eval_config.device)
-
-        # 创建训练器
         trainer = FatigueTrainer(model, eval_config)
         trainer.history = checkpoint.get('history', trainer.history)
         trainer.best_metric = checkpoint.get('best_metric', trainer.best_metric)
-
-        # 创建测试数据加载器
-        test_dataset = SEEDVIGDataset(
-            config=eval_config,
-            subject_ids=args.subject_ids,
-            mode='val'
-        )
-
-        test_loader = torch.utils.data.DataLoader(
-            test_dataset,
-            batch_size=eval_config.batch_size,
-            shuffle=False,
-            num_workers=4
-        )
-
-        # 评估模型
+        test_dataset = SEEDVIGDataset(eval_config, subject_ids=args.subject_ids, mode='val')
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=eval_config.batch_size, shuffle=False, num_workers=4)
         test_metrics = trainer.evaluate(test_loader)
-
         print(f"\n测试集性能:")
         for key, value in test_metrics.items():
             print(f"  {key}: {value:.4f}")
@@ -424,6 +251,4 @@ def main():
 
 
 if __name__ == '__main__':
-    # 将这里原来的 `import datetime` 修改为以下代码
-    import datetime
     main()

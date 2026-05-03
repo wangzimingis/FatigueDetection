@@ -22,6 +22,7 @@ class SEEDVIGDataset(Dataset):
         # 如果未指定被试者，使用前5个被试者（测试用）或全部
         if subject_ids is None:
             subject_ids = list(range(1, min(6, config.num_subjects + 1)))  # 先使用前5个加快测试
+            #subject_ids = list(range(1,  config.num_subjects + 1))  # 使用22个
 
         # 加载数据
         self.data = self._load_all_subjects(subject_ids)

@@ -352,6 +352,227 @@ class TransformerEncoderLayerNoCausal(nn.Module):
 
         return src
 
+# ==================== 新增 HyperLSTM 核心组件 ====================
+class LayerNorm(nn.Module):
+    """层归一化（与之前一致）"""
+    def __init__(self, num_features, eps=1e-6):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.FloatTensor(num_features))
+        self.beta = nn.Parameter(torch.FloatTensor(num_features))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.constant_(self.gamma, 1)
+        nn.init.constant_(self.beta, 0)
+
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
+        return self.gamma * (x - mean) / (std + self.eps) + self.beta
+
+
+class ParallelLayerNorm(nn.Module):
+    """并行层归一化（同时处理多个输入张量）"""
+    def __init__(self, num_inputs, num_features, eps=1e-6):
+        super().__init__()
+        self.num_inputs = num_inputs
+        self.num_features = num_features
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.FloatTensor(num_inputs, num_features))
+        self.beta = nn.Parameter(torch.FloatTensor(num_inputs, num_features))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.constant_(self.gamma, 1)
+        nn.init.constant_(self.beta, 0)
+
+    def forward(self, *inputs):
+        inputs_stacked = torch.stack(inputs, dim=-2)  # (batch, num_inputs, features)
+        mean = inputs_stacked.mean(dim=-1, keepdim=True)
+        std = inputs_stacked.std(dim=-1, keepdim=True)
+        outputs_stacked = (self.gamma * (inputs_stacked - mean) / (std + self.eps) + self.beta)
+        return torch.unbind(outputs_stacked, dim=-2)
+
+
+class LSTMCell(nn.Module):
+    """标准 LSTM Cell（支持 LayerNorm）"""
+    def __init__(self, input_size, hidden_size, use_layer_norm, dropout_prob=0):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.use_layer_norm = use_layer_norm
+        self.dropout_prob = dropout_prob
+
+        self.linear_ih = nn.Linear(input_size, 4 * hidden_size)
+        self.linear_hh = nn.Linear(hidden_size, 4 * hidden_size, bias=False)
+        self.dropout = nn.Dropout(dropout_prob)
+        if use_layer_norm:
+            self.ln_ifgo = ParallelLayerNorm(4, hidden_size)
+            self.ln_c = LayerNorm(hidden_size)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.linear_ih.weight)
+        nn.init.constant_(self.linear_ih.bias, 0)
+        nn.init.orthogonal_(self.linear_hh.weight)
+        if self.use_layer_norm:
+            self.ln_ifgo.reset_parameters()
+            self.ln_c.reset_parameters()
+
+    def forward(self, x, state):
+        if state is None:
+            batch_size = x.size(0)
+            h = x.new_zeros(batch_size, self.hidden_size)
+            c = x.new_zeros(batch_size, self.hidden_size)
+            state = (h, c)
+        h, c = state
+        lstm_vec = self.linear_ih(x) + self.linear_hh(h)
+        i, f, g, o = lstm_vec.chunk(4, dim=1)
+        if self.use_layer_norm:
+            i, f, g, o = self.ln_ifgo(i, f, g, o)
+        f = f + 1
+        new_c = c * f.sigmoid() + i.sigmoid() * self.dropout(g.tanh())
+        if self.use_layer_norm:
+            new_c = self.ln_c(new_c)
+        new_h = new_c.tanh() * o.sigmoid()
+        return new_h, (new_h, new_c)
+
+
+class HyperLSTMCell(nn.Module):
+    """超网络 LSTM Cell（核心）"""
+    def __init__(self, input_size, hidden_size,
+                 hyper_hidden_size, hyper_embedding_size,
+                 use_layer_norm, dropout_prob):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.hyper_hidden_size = hyper_hidden_size
+        self.hyper_embedding_size = hyper_embedding_size
+        self.use_layer_norm = use_layer_norm
+        self.dropout_prob = dropout_prob
+
+        # Hyper LSTM cell
+        self.hyper_cell = LSTMCell(
+            input_size + hidden_size,
+            hyper_hidden_size,
+            use_layer_norm,
+            dropout_prob
+        )
+
+        # Projection layers (from hyper hidden state to embedding)
+        # suffixes: h, x, b
+        for suffix in ['h', 'x', 'b']:
+            for name in ['i', 'f', 'g', 'o']:
+                setattr(self, f'hyper_proj_{name}{suffix}',
+                        nn.Linear(hyper_hidden_size, hyper_embedding_size,
+                                  bias=False if suffix == 'b' else True))
+        # Scaling layers (from embedding to main LSTM parameters)
+        for suffix in ['h', 'x', 'b']:
+            for name in ['i', 'f', 'g', 'o']:
+                setattr(self, f'hyper_scale_{name}{suffix}',
+                        nn.Linear(hyper_embedding_size, hidden_size, bias=False))
+
+        # Main LSTM parameters
+        self.linear_ih = nn.Linear(input_size, 4 * hidden_size, bias=False)
+        self.linear_hh = nn.Linear(hidden_size, 4 * hidden_size, bias=False)
+        self.bias = nn.Parameter(torch.FloatTensor(4 * hidden_size))
+
+        if use_layer_norm:
+            self.ln_ifgo = ParallelLayerNorm(4, hidden_size)
+            self.ln_c = LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout_prob)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.hyper_cell.reset_parameters()
+        # Projection layers init
+        for suffix in ['h', 'x', 'b']:
+            for name in ['i', 'f', 'g', 'o']:
+                proj = getattr(self, f'hyper_proj_{name}{suffix}')
+                if suffix == 'b':
+                    nn.init.normal_(proj.weight, 0, 0.01)
+                    if proj.bias is not None:
+                        nn.init.constant_(proj.bias, 0)
+                else:
+                    nn.init.constant_(proj.weight, 0)
+                    if proj.bias is not None:
+                        nn.init.constant_(proj.bias, 1)
+
+        # Scaling layers init
+        for suffix in ['h', 'x', 'b']:
+            for name in ['i', 'f', 'g', 'o']:
+                scale = getattr(self, f'hyper_scale_{name}{suffix}')
+                nn.init.constant_(scale.weight, 0.1 / self.hyper_embedding_size)
+
+        # Main LSTM
+        nn.init.xavier_uniform_(self.linear_ih.weight)
+        nn.init.orthogonal_(self.linear_hh.weight)
+        nn.init.constant_(self.bias, 0)
+
+        if self.use_layer_norm:
+            self.ln_ifgo.reset_parameters()
+            self.ln_c.reset_parameters()
+
+    def _get_hyper_vector(self, hyper_h, fullname):
+        proj = getattr(self, f'hyper_proj_{fullname}')
+        scale = getattr(self, f'hyper_scale_{fullname}')
+        return scale(proj(hyper_h))
+
+    def forward(self, x, state, hyper_state, mask=None):
+        if state is None:
+            batch_size = x.size(0)
+            h = x.new_zeros(batch_size, self.hidden_size)
+            c = x.new_zeros(batch_size, self.hidden_size)
+            state = (h, c)
+        h, c = state
+
+        # Hyper LSTM step
+        hyper_input = torch.cat([x, h], dim=1)
+        new_hyper_h, new_hyper_state = self.hyper_cell(hyper_input, hyper_state)
+
+        # Compute main LSTM gates
+        xh = self.linear_ih(x)
+        hh = self.linear_hh(h)
+        ix, fx, gx, ox = xh.chunk(4, dim=1)
+        ih, fh, gh, oh = hh.chunk(4, dim=1)
+        ib, fb, gb, ob = self.bias.chunk(4, dim=0)
+
+        # Apply hyper vectors to each component
+        ix = ix * self._get_hyper_vector(new_hyper_h, 'ix')
+        fx = fx * self._get_hyper_vector(new_hyper_h, 'fx')
+        gx = gx * self._get_hyper_vector(new_hyper_h, 'gx')
+        ox = ox * self._get_hyper_vector(new_hyper_h, 'ox')
+
+        ih = ih * self._get_hyper_vector(new_hyper_h, 'ih')
+        fh = fh * self._get_hyper_vector(new_hyper_h, 'fh')
+        gh = gh * self._get_hyper_vector(new_hyper_h, 'gh')
+        oh = oh * self._get_hyper_vector(new_hyper_h, 'oh')
+
+        ib = ib + self._get_hyper_vector(new_hyper_h, 'ib')
+        fb = fb + self._get_hyper_vector(new_hyper_h, 'fb')
+        gb = gb + self._get_hyper_vector(new_hyper_h, 'gb')
+        ob = ob + self._get_hyper_vector(new_hyper_h, 'ob')
+
+        i = ix + ih + ib
+        f = fx + fh + fb + 1
+        g = gx + gh + gb
+        o = ox + oh + ob
+
+        if self.use_layer_norm:
+            i, f, g, o = self.ln_ifgo(i, f, g, o)
+        new_c = c * f.sigmoid() + i.sigmoid() * self.dropout(g.tanh())
+        if self.use_layer_norm:
+            new_c = self.ln_c(new_c)
+        new_h = new_c.tanh() * o.sigmoid()
+
+        if mask is not None:
+            mask = mask.unsqueeze(1)
+            new_h = new_h * mask + h * (1 - mask)
+            new_c = new_c * mask + c * (1 - mask)
+
+        return new_h, (new_h, new_c), new_hyper_state
 
 class EEGTransformer(nn.Module):
     """EEG Transformer特征提取器 - 修复版本"""
@@ -423,6 +644,73 @@ class EEGTransformer(nn.Module):
 
         return x
 
+
+class EEGHyperLSTM(nn.Module):
+    """EEG HyperLSTM 特征提取器 (超网络LSTM)"""
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        # 特征维度
+        if config.feature_type == '2Hz':
+            feature_dim = config.frequency_bands
+        else:
+            feature_dim = config.five_bands
+
+        # 输入投影层（将特征维度映射到 64）
+        self.input_proj = nn.Linear(feature_dim, 64)
+        self.relu = nn.ReLU()
+
+        # HyperLSTM 参数
+        self.hidden_size = config.lstm_hidden          # 主 LSTM 隐藏维度
+        self.hyper_hidden_size = config.hyper_hidden_size    # 超网络隐藏维度
+        self.hyper_embedding_size = config.hyper_embedding_size
+
+        self.use_layer_norm = config.use_layer_norm
+        dropout = config.dropout_rate
+
+        # 创建 HyperLSTM Cell
+        self.hyperlstm_cell = HyperLSTMCell(
+            input_size=64,
+            hidden_size=self.hidden_size,
+            hyper_hidden_size=self.hyper_hidden_size,
+            hyper_embedding_size=self.hyper_embedding_size,
+            use_layer_norm=self.use_layer_norm,
+            dropout_prob=dropout
+        )
+
+        # 时序注意力（与 EEGLSTM 保持一致）
+        self.temporal_attention = TemporalAttention(self.hidden_size)
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+        self.output_dim = self.hidden_size
+
+    def forward(self, x):
+        # x: (batch, channels, features)
+        batch_size, channels, _ = x.shape
+
+        # 投影特征
+        x = self.input_proj(x)          # (batch, channels, 64)
+        x = self.relu(x)
+
+        # 将 channels 作为时间步，依次输入 HyperLSTM Cell
+        state = None          # (h, c)
+        hyper_state = None    # (hyper_h, hyper_c)
+        outputs = []
+
+        for t in range(channels):
+            x_t = x[:, t, :]   # (batch, 64)
+            h_t, state, hyper_state = self.hyperlstm_cell(x_t, state, hyper_state)
+            outputs.append(h_t)
+
+        # 堆叠所有时间步的输出 (batch, channels, hidden_size)
+        outputs = torch.stack(outputs, dim=1)
+
+        # 时序注意力池化 -> 生成最终固定长度的特征向量
+        attended_features, attention_weights = self.temporal_attention(outputs)
+        attended_features = self.dropout(attended_features)
+
+        return attended_features, attention_weights
 
 class MultiModalFusion(nn.Module):
     """多模态融合模块"""
@@ -580,6 +868,10 @@ class MultiModalFatigueModel(nn.Module):
             self.eeg_extractor = EEGTransformer(config)
             eeg_output_dim = self.eeg_extractor.output_dim
 
+        elif config.model_type == 'hyperlstm':
+            self.eeg_extractor = EEGHyperLSTM(config)
+            eeg_output_dim = self.eeg_extractor.output_dim
+
         else:
             raise ValueError(f"未知的模型类型: {config.model_type}")
 
@@ -636,7 +928,7 @@ class MultiModalFatigueModel(nn.Module):
 
     def forward(self, eeg, eog=None):
         # EEG特征提取
-        if isinstance(self.eeg_extractor, EEGLSTM):
+        if isinstance(self.eeg_extractor, (EEGLSTM, EEGHyperLSTM)):
             eeg_features, attention_weights = self.eeg_extractor(eeg)
         else:
             eeg_features = self.eeg_extractor(eeg)
@@ -656,7 +948,6 @@ class MultiModalFatigueModel(nn.Module):
 
         # 分类/回归
         output = self.classifier(fused_features)
-
         return output
 
 
@@ -664,7 +955,7 @@ class MultiModalFatigueModel(nn.Module):
 def create_model(config):
     """创建模型工厂函数"""
 
-    if config.model_type in ['cnn', 'lstm', 'transformer']:
+    if config.model_type in ['cnn', 'lstm', 'transformer', 'hyperlstm']:
         model = MultiModalFatigueModel(config)
         model_name = f"多模态{config.model_type.upper()}模型"
 

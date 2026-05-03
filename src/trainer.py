@@ -20,6 +20,9 @@ import json
 import copy
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple, Any
+import pandas as pd
+from datetime import datetime
+import config
 
 # 尝试导入中文字体检测，如果失败则使用英文字体
 try:
@@ -156,6 +159,7 @@ class FatigueTrainer:
 
             # 混合精度前向
             with autocast(enabled=self.config.use_mixed_precision):
+
                 outputs = self.model(eeg, eog)
 
                 if self.task_type == 'classification':
@@ -248,6 +252,87 @@ class FatigueTrainer:
         val_metrics = self._compute_metrics(all_labels, all_preds, all_probs if all_probs else None)
 
         return val_loss, val_metrics, (all_preds, all_labels, all_probs)
+
+    def save_full_training_history(self, filepath=None, overwrite=True):
+        """
+        将整个训练过程中的所有 epoch 指标保存到 Excel 文件
+        (每个 epoch 一行，包含训练/验证损失、F1、准确率等)
+
+        Args:
+            filepath: 保存路径，若为 None 则使用默认固定名称
+            overwrite: 如果文件已存在，是否覆盖（True: 覆盖整个文件；False: 追加新工作表）
+        """
+        if not self.history or not self.history.get('train_loss'):
+            print("没有训练历史数据，无法保存。")
+            return False
+
+        if filepath is None:
+            # 使用固定的文件名（不随时间戳变化）
+            filepath = os.path.join(self.config.result_dir, 'training_history.xlsx')
+
+        # 确保目录存在
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        epochs = list(range(1, len(self.history['train_loss']) + 1))
+        train_loss = self.history['train_loss']
+        val_loss = self.history['val_loss']
+
+        if self.task_type == 'classification':
+            train_f1 = [m['f1'] for m in self.history['train_metrics']]
+            val_f1 = [m['f1'] for m in self.history['val_metrics']]
+            train_acc = [m['accuracy'] for m in self.history['train_metrics']]
+            val_acc = [m['accuracy'] for m in self.history['val_metrics']]
+
+            df = pd.DataFrame({
+                'Epoch': epochs,
+                'Train_Loss': train_loss,
+                'Val_Loss': val_loss,
+                'Train_F1': train_f1,
+                'Val_F1': val_f1,
+                'Train_Accuracy': train_acc,
+                'Val_Accuracy': val_acc
+            })
+        else:  # regression
+            train_rmse = [m['rmse'] for m in self.history['train_metrics']]
+            val_rmse = [m['rmse'] for m in self.history['val_metrics']]
+            train_r2 = [m['r2'] for m in self.history['train_metrics']]
+            val_r2 = [m['r2'] for m in self.history['val_metrics']]
+
+            df = pd.DataFrame({
+                'Epoch': epochs,
+                'Train_Loss': train_loss,
+                'Val_Loss': val_loss,
+                'Train_RMSE': train_rmse,
+                'Val_RMSE': val_rmse,
+                'Train_R2': train_r2,
+                'Val_R2': val_r2
+            })
+
+        if self.history.get('learning_rates'):
+            df['Learning_Rate'] = self.history['learning_rates']
+
+        try:
+            if overwrite:
+                # 直接写入（覆盖整个文件）
+                with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+                    df.to_excel(writer, sheet_name='Training_History', index=False)
+            else:
+                # 追加新工作表：需要先判断文件是否存在
+                if os.path.exists(filepath):
+                    with pd.ExcelWriter(filepath, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+                        # 使用时间戳作为工作表名，避免重复
+                        sheet_name = f'Training_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        print(f"已追加新工作表 {sheet_name} 到 {filepath}")
+                else:
+                    # 文件不存在，直接创建
+                    with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+                        df.to_excel(writer, sheet_name='Training_History', index=False)
+            print(f"训练历史已保存到: {filepath}")
+            return True
+        except Exception as e:
+            print(f"保存训练历史失败: {e}")
+            return False
 
     def _compute_metrics(self, true_labels, pred_labels, pred_probs=None) -> Dict:
         """计算评估指标"""
@@ -350,6 +435,11 @@ class FatigueTrainer:
 
             # 打印指标
             self._print_metrics(train_loss, train_metrics, val_loss, val_metrics)
+
+            # 保存每次指标到xlsx
+            self.save_full_training_history()
+
+            #self.save_metrics_report(val_loader, os.path.join(self.config.result_dir, 'metrics_report.xlsx'))
 
             # TensorBoard 记录
             self._log_to_tensorboard(epoch, train_loss, train_metrics, val_loss, val_metrics)
