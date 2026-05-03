@@ -234,16 +234,11 @@ class EEGLSTM(nn.Module):
 
     def forward(self, x):
         # x: (batch, channels, features)
-        batch_size, channels, features = x.shape
-
-        # 将通道维度视为序列维度
-        x = x.transpose(1, 2)  # (batch, features, channels)
-
-        # 输入投影
-        x = self.input_proj(x)
+        # 输入投影：将 features 映射到 64
+        x = self.input_proj(x)          # (batch, channels, 64)
         x = F.relu(x)
 
-        # LSTM处理
+        # LSTM 处理，输入形状 (batch, seq_len=channels, input_size=64)
         lstm_out, (h_n, c_n) = self.lstm(x)
 
         # 时序注意力

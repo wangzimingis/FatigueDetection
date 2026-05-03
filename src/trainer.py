@@ -58,6 +58,8 @@ class FatigueTrainer:
         self.task_type = getattr(config, 'task_type',
                                  getattr(config, 'classification_type', 'classification'))
 
+        # 👇 先初始化这个属性，避免 AttributeError
+        self._train_loader_for_weights = None
         # 损失函数与类别权重
         class_weights = self._compute_class_weights_from_dataloader()
         if self.task_type == 'classification':
@@ -105,8 +107,6 @@ class FatigueTrainer:
         self.best_model_state = None
         self.patience_counter = 0
 
-        # 用于计算类别权重的临时数据加载器（在train方法中设置）
-        self._train_loader_for_weights = None
 
         print(f"训练器初始化完成 | 设备: {self.device} | 混合精度: {config.use_mixed_precision}")
         print(f"任务类型: {'分类' if self.task_type == 'classification' else '回归'}")
