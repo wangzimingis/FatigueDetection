@@ -245,6 +245,5 @@ def demonstrate_metrics():
         print("保存失败，请检查依赖或权限。")
     return metrics
 
-
 if __name__ == '__main__':
     demonstrate_metrics()

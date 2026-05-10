@@ -12,35 +12,98 @@ warnings.filterwarnings('ignore')
 
 
 class SEEDVIGDataset(Dataset):
-    """SEED-VIG数据集类 - 修复版本"""
+    """SEED-VIG数据集类 - 基于文件索引的精确加载版本"""
 
     def __init__(self, config, subject_ids=None, mode='train', transform=None):
         self.config = config
         self.mode = mode
         self.transform = transform
 
-        # 如果未指定被试者，使用前5个被试者（测试用）或全部
+        # 1. 构建实验文件索引（按文件名排序后，每个实验包含EEG/EOG/标签路径）
+        self.experiment_index = self._build_experiment_index()
+
+        # 2. 确定要加载的实验序号
         if subject_ids is None:
-            subject_ids = list(range(1, min(6, config.num_subjects + 1)))  # 先使用前5个加快测试
-            #subject_ids = list(range(1,  config.num_subjects + 1))  # 使用22个
+            # 默认加载所有实验
+            subject_ids = list(range(1, len(self.experiment_index) + 1))
+        else:
+            # 过滤掉超出范围的序号
+            max_id = len(self.experiment_index)
+            valid_ids = [sid for sid in subject_ids if 1 <= sid <= max_id]
+            if len(valid_ids) != len(subject_ids):
+                print(f"警告: 部分subject_id超出范围[1, {max_id}]，已忽略无效ID")
+            subject_ids = valid_ids
 
-        # 加载数据
-        self.data = self._load_all_subjects(subject_ids)
+        # 3. 加载指定实验的数据
+        self.data = self._load_experiments_by_ids(subject_ids)
 
-        # 预处理
+        # 4. 预处理
         self._preprocess()
 
         print(f"数据集初始化完成: {mode}模式，{len(self)}个样本")
 
-    def _load_all_subjects(self, subject_ids):
-        """加载所有被试者数据"""
+    def _build_experiment_index(self):
+        """扫描数据集目录，返回按数字编号排序的实验索引列表"""
+        base_path = Path(self.config.data_root)
+        feature_type = self.config.feature_type
+        use_eog = self.config.use_eog
+
+        eeg_dir = base_path / f"EEG_Feature_{feature_type}"
+        eog_dir = base_path / "EOG_Feature" if use_eog else None
+        label_dir = base_path / "perclos_labels"
+
+        # 收集所有非Forehead的EEG .mat文件
+        eeg_files = []
+        for f in eeg_dir.glob("*.mat"):
+            if f.parent.name.startswith("Forehead"):
+                continue
+            eeg_files.append(f)
+
+        # ---- 自然排序：按文件名开头的数字，数字相同时按完整文件名排序 ----
+        def sort_key(filepath):
+            stem = filepath.stem
+            # 提取开头的数字（例如 "4_20151107_noon" -> 4, "10_20151125_noon" -> 10）
+            num_str = stem.split('_')[0]
+            try:
+                number = int(num_str)
+            except ValueError:
+                number = 0  # 容错
+            return (number, stem)
+
+        eeg_files.sort(key=sort_key)
+
+        experiments = []
+        for eeg_file in eeg_files:
+            stem = eeg_file.stem
+            eog_file = eog_dir / f"{stem}.mat" if eog_dir else None
+            label_file = label_dir / f"{stem}.mat"
+
+            if use_eog and (eog_file is None or not eog_file.exists()):
+                print(f"  跳过实验 {stem}: 缺少EOG文件")
+                continue
+            if not label_file.exists():
+                print(f"  跳过实验 {stem}: 缺少标签文件")
+                continue
+
+            experiments.append({
+                'eeg': eeg_file,
+                'eog': eog_file if use_eog else None,
+                'label': label_file
+            })
+
+        print(f"构建实验索引完成，共发现 {len(experiments)} 个有效实验")
+        return experiments
+
+    def _load_experiments_by_ids(self, exp_ids):
+        """通过实验索引加载数据"""
         all_eeg = []
         all_eog = []
         all_labels = []
 
-        for subject_id in subject_ids:
-            print(f"  加载被试 {subject_id}...")
-            data = self._load_subject(subject_id)
+        for exp_id in exp_ids:
+            print(f"  加载实验 {exp_id}...")
+            exp_info = self.experiment_index[exp_id - 1]  # 索引从0开始
+            data = self._load_single_experiment(exp_info)
             if data is not None:
                 eeg, eog, labels = data
                 all_eeg.append(eeg)
@@ -48,9 +111,8 @@ class SEEDVIGDataset(Dataset):
                     all_eog.append(eog)
                 all_labels.append(labels)
             else:
-                print(f"  警告: 被试 {subject_id} 数据加载失败")
+                print(f"  警告: 实验 {exp_id} 数据加载失败")
 
-        # 合并数据
         if not all_eeg:
             raise ValueError("未加载到任何有效数据")
 
@@ -61,7 +123,6 @@ class SEEDVIGDataset(Dataset):
         if all_eog:
             combined_eog = np.concatenate(all_eog, axis=0)
 
-        # 检查数据形状
         print(f"  EEG形状: {combined_eeg.shape}")
         print(f"  标签形状: {combined_labels.shape}")
         if combined_eog is not None:
@@ -73,87 +134,43 @@ class SEEDVIGDataset(Dataset):
             'labels': combined_labels
         }
 
-    def _load_subject(self, subject_id):
-        """加载单个被试者数据"""
-        base_path = Path(self.config.data_root)
+    def _load_single_experiment(self, file_dict):
+        """加载单个实验的文件，file_dict包含'eeg','eog','label'的Path对象"""
+        eeg_file = file_dict['eeg']
+        eog_file = file_dict.get('eog')
+        label_file = file_dict['label']
 
-        # 查找EEG文件
-        eeg_patterns = [
-            f"{subject_id}_*.mat",
-            f"{subject_id:02d}_*.mat",
-            f"*{subject_id}_*.mat",
-            f"*{subject_id:02d}_*.mat"
-        ]
-
-        eeg_file = None
-        for pattern in eeg_patterns:
-            if self.config.feature_type == '2Hz':
-                files = list(base_path.glob(f"EEG_Feature_2Hz/{pattern}"))
-            else:
-                files = list(base_path.glob(f"EEG_Feature_5Bands/{pattern}"))
-
-            if files:
-                eeg_file = files[0]
-                print(f"    找到EEG文件: {eeg_file.name}")
-                break
-
-        if eeg_file is None:
-            print(f"    未找到被试者{subject_id}的EEG数据")
-            return None
-
-        # 加载EEG数据
+        # 加载EEG
         eeg_data = self._load_mat_file(eeg_file)
         if eeg_data is None:
             return None
+        print(f"    找到EEG文件: {eeg_file.name}")
 
-        # 处理EEG数据维度
-        # 原始格式: (channels, samples, features) -> 需要转换为 (samples, channels, features)
+        # 维度转换 (channels, samples, features) -> (samples, channels, features)
         if eeg_data.ndim == 3:
-            # 检查维度顺序
-            if eeg_data.shape[0] in [17, 4]:  # 如果是通道数在前
-                eeg_data = np.transpose(eeg_data, (1, 0, 2))  # (samples, channels, features)
-            elif eeg_data.shape[2] in [17, 4]:  # 如果是通道数在最后
-                eeg_data = np.transpose(eeg_data, (0, 2, 1))  # (samples, channels, features)
+            if eeg_data.shape[0] in [17, 4]:  # 通道优先
+                eeg_data = np.transpose(eeg_data, (1, 0, 2))
+            elif eeg_data.shape[2] in [17, 4]:  # 通道在后
+                eeg_data = np.transpose(eeg_data, (0, 2, 1))
 
-        # 查找EOG文件
-        eog_file = None
-        if self.config.use_eog:
-            for pattern in eeg_patterns:
-                files = list(base_path.glob(f"EOG_Feature/{pattern}"))
-                if files:
-                    eog_file = files[0]
-                    print(f"    找到EOG文件: {eog_file.name}")
-                    break
-
+        # 加载EOG
         eog_data = None
-        if eog_file:
+        if eog_file is not None:
             eog_data = self._load_mat_file(eog_file)
             if isinstance(eog_data, dict):
+                # 尝试常见的键
                 for key in ['features_table_ica', 'features_table_minus', 'eog_features']:
                     if key in eog_data:
                         eog_data = eog_data[key]
                         break
             if eog_data is not None:
-                # 确保EOG是2D数组 (samples, features)
                 if eog_data.ndim == 1:
                     eog_data = eog_data.reshape(-1, 1)
                 elif eog_data.ndim == 2 and eog_data.shape[0] != eeg_data.shape[0]:
-                    # 可能维度需要转置
                     eog_data = eog_data.T
+            print(f"    找到EOG文件: {eog_file.name}")
 
-        # 查找标签文件
-        label_file = None
-        for pattern in eeg_patterns:
-            files = list(base_path.glob(f"perclos_labels/{pattern}"))
-            if files:
-                label_file = files[0]
-                print(f"    找到标签文件: {label_file.name}")
-                break
-
-        if label_file is None:
-            print(f"    未找到被试者{subject_id}的标签")
-            return None
-
+        # 加载标签
         label_data = self._load_mat_file(label_file)
         if isinstance(label_data, dict):
             for key in ['perclos_labels', 'perclos', 'label', 'y']:
@@ -161,30 +178,27 @@ class SEEDVIGDataset(Dataset):
                     labels = label_data[key].flatten()
                     break
             else:
-                # 如果没有找到标准键，取第一个非系统变量
+                # 取第一个非系统键
                 for key in label_data:
                     if not key.startswith('__'):
                         labels = label_data[key].flatten()
                         break
         else:
             labels = label_data.flatten()
+        print(f"    找到标签文件: {label_file.name}")
 
-        # 确保数据长度一致
+        # 数据对齐（取最小长度）
         min_len = min(
             eeg_data.shape[0],
             len(labels),
             eog_data.shape[0] if eog_data is not None else float('inf')
         )
-
         eeg_data = eeg_data[:min_len]
         labels = labels[:min_len]
-
         if eog_data is not None:
             eog_data = eog_data[:min_len]
 
-        print(
-            f"    数据对齐: EEG={eeg_data.shape}, EOG={eog_data.shape if eog_data is not None else 'None'}, Labels={len(labels)}")
-
+        print(f"    数据对齐: EEG={eeg_data.shape}, EOG={eog_data.shape if eog_data is not None else 'None'}, Labels={len(labels)}")
         return eeg_data, eog_data, labels
 
     def _load_mat_file(self, filepath):
@@ -205,7 +219,7 @@ class SEEDVIGDataset(Dataset):
                 return None
         return None
 
-    #对数据进行预处理，标准化、归一化、标签处理
+    # 对数据进行预处理，标准化、归一化、标签处理
     def _preprocess(self):
         """数据预处理"""
         # 标准化
@@ -248,10 +262,7 @@ class SEEDVIGDataset(Dataset):
         thresholds = self.config.regression_thresholds
         class_labels = np.zeros_like(regression_labels, dtype=np.int64)
 
-        # 注意：根据PERCLOS的定义，值越大表示越疲劳
-        # 清醒: PERCLOS < 0.3
-        # 轻度疲劳: 0.3 <= PERCLOS < 0.6
-        # 重度疲劳: PERCLOS >= 0.6
+        # 根据PERCLOS定义：值越大越疲劳
         class_labels[regression_labels < thresholds['alert']] = 0  # 清醒
         class_labels[(regression_labels >= thresholds['alert']) &
                      (regression_labels < thresholds['mild'])] = 1  # 轻度疲劳
@@ -266,7 +277,6 @@ class SEEDVIGDataset(Dataset):
         eeg = self.data['eeg'][idx].astype(np.float32)
         label = self.data['labels'][idx]
 
-        # 创建样本字典
         sample = {
             'eeg': torch.FloatTensor(eeg),
             'label': torch.tensor(label,
@@ -277,7 +287,6 @@ class SEEDVIGDataset(Dataset):
             eog = self.data['eog'][idx].astype(np.float32)
             sample['eog'] = torch.FloatTensor(eog)
 
-        # 数据增强（仅训练集）
         if self.mode == 'train' and self.transform is not None:
             sample = self.transform(sample)
 
@@ -285,7 +294,7 @@ class SEEDVIGDataset(Dataset):
 
 
 class DataAugmentation:
-    """数据增强类 - 修复版本"""
+    """数据增强类"""
 
     def __init__(self, noise_std=0.01, scale_range=(0.9, 1.1), drop_prob=0.1):
         self.noise_std = noise_std
@@ -293,14 +302,11 @@ class DataAugmentation:
         self.drop_prob = drop_prob
 
     def __call__(self, sample):
-        """应用数据增强"""
         augmented = {}
-
-        # 处理EEG
         if 'eeg' in sample:
             eeg_np = sample['eeg'].numpy()
 
-            # 随机添加高斯噪声
+            # 高斯噪声
             if np.random.random() > 0.5:
                 noise = np.random.normal(0, self.noise_std, eeg_np.shape).astype(np.float32)
                 eeg_np = eeg_np + noise
@@ -318,22 +324,19 @@ class DataAugmentation:
 
             augmented['eeg'] = torch.FloatTensor(eeg_np)
 
-        # 保持其他数据不变
         for key in sample:
             if key not in augmented:
                 augmented[key] = sample[key]
-
         return augmented
 
 
 def create_dataloaders(config, subject_ids=None, batch_size=None):
-    """创建数据加载器"""
+    """创建数据加载器（划分训练/验证集）"""
     if batch_size is None:
         batch_size = config.batch_size
 
     print("创建数据加载器...")
 
-    # 创建完整数据集
     dataset = SEEDVIGDataset(
         config=config,
         subject_ids=subject_ids,
@@ -341,7 +344,6 @@ def create_dataloaders(config, subject_ids=None, batch_size=None):
         transform=None
     )
 
-    # 划分训练集和验证集 (80%训练，20%验证)
     total_samples = len(dataset)
     train_size = int(0.8 * total_samples)
     val_size = total_samples - train_size
@@ -355,37 +357,23 @@ def create_dataloaders(config, subject_ids=None, batch_size=None):
 
     print(f"  数据集划分: 训练集={train_size}, 验证集={val_size}")
 
-    # 创建数据增强
     train_transform = DataAugmentation(
         noise_std=0.01,
         scale_range=(0.9, 1.1),
         drop_prob=0.1
     )
 
-    # 创建子数据集
-    train_dataset = SubsetWithTransform(
-        dataset,
-        train_indices,
-        transform=train_transform
-    )
-
+    train_dataset = SubsetWithTransform(dataset, train_indices, transform=train_transform)
     val_dataset = Subset(dataset, val_indices)
 
-    # 类别平衡采样（仅分类任务）
     sampler = None
     if config.task_type == 'classification':
-        # 获取训练集标签
         train_labels = [dataset.data['labels'][i] for i in train_indices]
-
-        # 确保标签是整数
         train_labels = [int(label) for label in train_labels]
 
-        # 检查类别数量
         unique_labels = np.unique(train_labels)
         if len(unique_labels) == config.num_classes:
             class_counts = np.bincount(train_labels, minlength=config.num_classes)
-
-            # 避免除零错误
             if class_counts.min() > 0:
                 class_weights = 1.0 / class_counts
                 sample_weights = class_weights[train_labels]
@@ -396,13 +384,12 @@ def create_dataloaders(config, subject_ids=None, batch_size=None):
         else:
             print(f"  警告: 训练集类别数({len(unique_labels)})不等于配置类别数({config.num_classes})")
 
-    # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         sampler=sampler,
         shuffle=sampler is None,
-        num_workers=0,  # Windows下设置为0避免问题
+        num_workers=0,
         pin_memory=config.device == 'cuda',
         drop_last=True if len(train_dataset) > batch_size else False
     )
@@ -436,8 +423,7 @@ class SubsetWithTransform(Subset):
 
 
 def create_cross_validation_dataloaders(config, subject_id, fold_idx):
-    """创建交叉验证数据加载器 - 简化版本"""
-    # 创建数据集
+    """创建交叉验证数据加载器（单个实验内按样本5折）"""
     dataset = SEEDVIGDataset(
         config=config,
         subject_ids=[subject_id],
@@ -445,7 +431,6 @@ def create_cross_validation_dataloaders(config, subject_id, fold_idx):
         transform=None
     )
 
-    # 5折划分
     n_samples = len(dataset)
     fold_size = n_samples // config.n_folds
 
@@ -455,18 +440,15 @@ def create_cross_validation_dataloaders(config, subject_id, fold_idx):
     val_indices = list(range(val_start, val_end))
     train_indices = list(range(0, val_start)) + list(range(val_end, n_samples))
 
-    # 数据增强
     train_transform = DataAugmentation(
         noise_std=0.01,
         scale_range=(0.9, 1.1),
         drop_prob=0.1
     )
 
-    # 创建子数据集
     train_dataset = SubsetWithTransform(dataset, train_indices, transform=train_transform)
     val_dataset = Subset(dataset, val_indices)
 
-    # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -486,7 +468,6 @@ def create_cross_validation_dataloaders(config, subject_id, fold_idx):
     return train_loader, val_loader
 
 
-# 测试函数
 def test_data_loader():
     """测试数据加载器"""
     from config import Config
@@ -495,31 +476,25 @@ def test_data_loader():
     print("测试数据加载器")
     print("=" * 60)
 
-    # 创建配置
     config = Config()
     config.data_root = './data/SEED-VIG/'
     config.feature_type = '2Hz'
     config.use_eog = True
     config.task_type = 'classification'
-    config.num_subjects = 5  # 测试用，只加载前5个
+    # 注意：现在的 subject_id 代表实验序号，而不是原始的“被试者号”
+    config.num_subjects = 5  # 测试用
 
     try:
-        # 测试数据加载
-        print("1. 测试数据集创建...")
+        print("1. 测试数据集创建（实验1）...")
         dataset = SEEDVIGDataset(config, subject_ids=[1])
-
-        # 获取样本
         sample = dataset[0]
         print(f"  样本形状 - EEG: {sample['eeg'].shape}, Label: {sample['label']}")
 
-        # 测试数据加载器
-        print("2. 测试数据加载器创建...")
-        train_loader, val_loader = create_dataloaders(config, subject_ids=[1], batch_size=4)
-
+        print("2. 测试数据加载器...")
+        train_loader, val_loader = create_dataloaders(config, subject_ids=[1,2], batch_size=4)
         batch = next(iter(train_loader))
         print(f"  批次数据 - EEG: {batch['eeg'].shape}, Label: {batch['label'].shape}")
 
-        # 测试数据增强
         print("3. 测试数据增强...")
         transform = DataAugmentation()
         augmented_sample = transform(sample)

@@ -49,6 +49,8 @@ def parse_arguments():
                         help='使用EOG特征')
     parser.add_argument('--use_multimodal', action='store_true', default=True,
                         help='使用多模态融合')
+    parser.add_argument('--no-use_eog', dest='use_eog', action='store_false', help='禁用EOG特征')
+    parser.add_argument('--no-use_multimodal', dest='use_multimodal', action='store_false', help='禁用多模态融合')
 
     # 任务类型
     parser.add_argument('--task', type=str, default='classification',
