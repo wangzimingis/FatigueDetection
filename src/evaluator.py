@@ -155,7 +155,7 @@ class FatigueEvaluator:
             # 从 config 获取类别数，默认 3
             n_classes = getattr(self.config, 'num_classes', 3)
             if n_classes == 3:
-                classes = ['清醒', '轻度疲劳', '重度疲劳']
+                classes = ['非疲劳', '轻度疲劳', '重度疲劳']
             elif n_classes == 2:
                 classes = ['非疲劳', '疲劳']
             else:
@@ -197,7 +197,7 @@ class FatigueEvaluator:
 
         if classes is None:
             if n_classes == 3:
-                classes = ['清醒', '轻度疲劳', '重度疲劳']
+                classes = ['非疲劳', '轻度疲劳', '重度疲劳']
             elif n_classes == 2:
                 classes = ['非疲劳', '疲劳']
             else:
@@ -240,7 +240,7 @@ class FatigueEvaluator:
         if classes is None:
             n_classes = getattr(self.config, 'num_classes', 3)
             if n_classes == 3:
-                classes = ['清醒', '轻度疲劳', '重度疲劳']
+                classes = ['非疲劳', '轻度疲劳', '重度疲劳']
             elif n_classes == 2:
                 classes = ['非疲劳', '疲劳']
             else:

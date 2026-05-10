@@ -51,15 +51,17 @@ class Config:
     # CNN配置
     cnn_channels: List[int] = field(default_factory=lambda: [64, 128, 256])
     cnn_kernel_sizes: List[int] = field(default_factory=lambda: [3, 3, 3])
-    dropout_rate: float = 0.3
+    dropout_rate: float = 0.5#0.3
 
     # LSTM配置
-    lstm_hidden: int = 128
-    lstm_layers: int = 2
+    # lstm_hidden: int = 128
+    # lstm_layers: int = 2
+    lstm_hidden = 64  # 原128，减小一半
+    lstm_layers = 1  # 原2层，改为单层
     lstm_bidirectional: bool = True
 
     # Transformer配置
-    transformer_dim: int = 256
+    transformer_dim: int = 128#256
     transformer_heads: int = 8
     transformer_layers: int = 4
     transformer_ff_dim: int = 512
@@ -75,9 +77,9 @@ class Config:
     # 训练配置
     batch_size: int = 32
     learning_rate: float = 1e-3
-    weight_decay: float = 1e-5
+    weight_decay: float = 1e-3#1e-5
     epochs: int = 50
-    patience: int = 10
+    patience: int = 15#10
     early_stopping: bool = True
     gradient_clip: float = 1.0
 
@@ -122,7 +124,7 @@ class Config:
         # 根据任务类型设置输出维度
         if self.task_type == 'regression':
             self.num_classes = 1
-            self.regression_thresholds = {'alert': 0.3, 'mild': 0.6, 'severe': 1.0}#清醒、轻度疲劳、重度疲劳
+            self.regression_thresholds = {'alert': 0.3, 'mild': 0.6, 'severe': 1.0}#非疲劳、轻度疲劳、重度疲劳
         else:
             self.num_classes = 3
 

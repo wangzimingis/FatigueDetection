@@ -4,6 +4,7 @@ import sys
 import os
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import datetime
 
 from config import Config
@@ -13,8 +14,6 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from src.data_loader import (
     SEEDVIGDataset,
-    create_dataloaders,
-    create_cross_validation_dataloaders,
     DataAugmentation
 )
 from src.feature_analyzer import (
@@ -22,11 +21,11 @@ from src.feature_analyzer import (
     FeatureVisualizer,
     analyze_dataset_statistics
 )
-from src.models import create_model, MultiModalFatigueModel
+from src.models import create_model
 from src.trainer import FatigueTrainer, cross_validation_training, hyperparameter_tuning
 from src.utils import set_seed, check_gpu, plot_model_architecture, setup_chinese_font
 
-# 初始化中文字体（使用完整版配置）
+# 初始化中文字体
 setup_chinese_font()
 
 
@@ -182,10 +181,14 @@ def main():
                 sample_labels.append(sample['label'].numpy())
             sample_data = np.array(sample_data)
             sample_labels = np.concatenate(sample_labels)
-            visualizer.plot_time_domain_features(sample_data, sample_labels, save_path=f"{config.figure_dir}/time_domain_features.png")
-            visualizer.plot_frequency_domain_features(sample_data, sample_labels, save_path=f"{config.figure_dir}/frequency_domain_features.png")
-            visualizer.plot_spatial_features(sample_data[0], save_path=f"{config.figure_dir}/spatial_features.png")
-            visualizer.plot_fatigue_analysis(sample_data, sample_labels, save_path=f"{config.figure_dir}/fatigue_analysis.png")
+            visualizer.plot_time_domain_features(sample_data, sample_labels,
+                                                 save_path=f"{config.figure_dir}/time_domain_features.png")
+            visualizer.plot_frequency_domain_features(sample_data, sample_labels,
+                                                      save_path=f"{config.figure_dir}/frequency_domain_features.png")
+            visualizer.plot_spatial_features(sample_data[0],
+                                             save_path=f"{config.figure_dir}/spatial_features.png")
+            visualizer.plot_fatigue_analysis(sample_data, sample_labels,
+                                             save_path=f"{config.figure_dir}/fatigue_analysis.png")
             print(f"特征可视化已保存到: {config.figure_dir}")
 
     # 模型训练
@@ -199,17 +202,101 @@ def main():
             avg_metrics = cross_validation_training(config, subject_ids=args.subject_ids, n_folds=config.n_folds)
             print(f"\n交叉验证完成！平均主要指标: {avg_metrics['main_metric']['mean']:.4f} ± {avg_metrics['main_metric']['std']:.4f}")
         else:
-            train_loader, val_loader = create_dataloaders(config, subject_ids=args.subject_ids, batch_size=config.batch_size)
-            print(f"训练集: {len(train_loader.dataset)} 个样本")
-            print(f"验证集: {len(val_loader.dataset)} 个样本")
+            # ========== 固定被试划分方案 ==========
+            train_ids = [1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20]  # 17个实验，训练
+            val_ids = [5,16, 19]  # 3个实验，验证20-5
+            test_ids = [21, 22, 23]  # 3个实验，测试
+
+            # 关键：禁用归一化，否则验证集/测试集会独立计算 min-max，破坏分布一致性
+            config.normalization = False
+
+            # 数据增强（仅训练集）
+            train_transform = DataAugmentation(noise_std=0.01, scale_range=(0.9, 1.1), drop_prob=0.1)
+
+            # 创建训练集（自己将会拟合 scaler）
+            train_dataset = SEEDVIGDataset(config, subject_ids=train_ids, mode='train',
+                                           transform=train_transform)
+
+            # 显式取出训练集拟合好的 scaler，确保后续验证集/测试集使用相同的缩放参数
+            train_eeg_scaler = train_dataset.eeg_scaler
+            train_eog_scaler = train_dataset.eog_scaler
+            if train_eeg_scaler is None:
+                raise RuntimeError("训练集 EEG scaler 为 None，标准化未生效！")
+            print(f"训练集 EEG scaler 已捕获，均值前3维示例: {train_eeg_scaler.mean_[:3]}")
+
+            # 创建验证集和测试集，传入训练集的 scaler
+            val_dataset = SEEDVIGDataset(config, subject_ids=val_ids, mode='val', transform=None,
+                                         scaler_eeg=train_eeg_scaler,
+                                         scaler_eog=train_eog_scaler)
+            test_dataset = SEEDVIGDataset(config, subject_ids=test_ids, mode='val', transform=None,
+                                          scaler_eeg=train_eeg_scaler,
+                                          scaler_eog=train_eog_scaler)
+
+            # ---------- 类别平衡采样 ----------
+            sampler = None
+            if config.task_type == 'classification':
+                train_labels = train_dataset.data['labels'].astype(int)
+                unique_labels = np.unique(train_labels)
+                if len(unique_labels) == config.num_classes:
+                    class_counts = np.bincount(train_labels, minlength=config.num_classes)
+                    if class_counts.min() > 0:
+                        class_weights = 1.0 / class_counts
+                        sample_weights = class_weights[train_labels]
+                        sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
+                        print(f"  类别平衡采样: 类别分布={class_counts.tolist()}")
+                    else:
+                        print(f"  警告: 某些类别样本数为0")
+                else:
+                    print(f"  警告: 训练集类别数({len(unique_labels)})不等于配置类别数({config.num_classes})")
+
+            # 创建 DataLoader
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=config.batch_size,
+                sampler=sampler,
+                shuffle=sampler is None,
+                num_workers=0,
+                pin_memory=config.device == 'cuda',
+                drop_last=True if len(train_dataset) > config.batch_size else False
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=config.device == 'cuda'
+            )
+
+            print(f"训练集: {len(train_dataset)} 个样本, {len(train_loader)} 个批次")
+            print(f"验证集: {len(val_dataset)} 个样本, {len(val_loader)} 个批次")
+            print(f"测试集 (实验IDs: {test_ids}) 共 {len(test_dataset)} 个样本，将在训练完成后评估")
+
+            # 创建模型
             model = create_model(config)
             plot_model_architecture(model, config, save_path=f"{config.figure_dir}/model_architecture.png")
+
+            # 训练
             trainer = FatigueTrainer(model, config)
             best_metric = trainer.train(train_loader, val_loader)
-            print(f"\n训练完成！最佳指标: {best_metric:.4f}")
-            val_metrics = trainer.evaluate(val_loader)
+            print(f"\n训练完成！最佳验证指标: {best_metric:.4f}")
+
+            # 保存最终模型（同时保存 Scaler，方便独立评估）
             trainer.save_checkpoint('final_model.pth')
-            #trainer.save_metrics_report(val_loader, os.path.join(config.result_dir, 'metrics_report.xlsx'))
+            # 可选：将 scaler 也保存到单独的 checkpoint 中
+            torch.save({'eeg_scaler': train_eeg_scaler, 'eog_scaler': train_eog_scaler},
+                       os.path.join(config.save_dir, 'scalers.pth'))
+
+            # ========== 在独立测试集上最终评估 ==========
+            print("\n" + "=" * 70)
+            print("在独立测试集上最终评估")
+            print("=" * 70)
+            test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False,
+                                     num_workers=0, pin_memory=config.device == 'cuda')
+            test_metrics = trainer.evaluate(test_loader, save_figures=True)
+            print(f"\n测试集最终性能摘要:")
+            for key, value in test_metrics.items():
+                if isinstance(value, float):
+                    print(f"  {key}: {value:.4f}")
 
     # 超参数调优
     if args.hyperparameter_tuning:
@@ -226,13 +313,13 @@ def main():
         print(f"最佳超参数: {best_params}")
         print(f"最佳得分: {best_score}")
 
-    # 模型评估
+    # 模型评估（单独评估模式）
     if args.evaluate and args.model_path:
         print("\n" + "=" * 70)
         print("模型评估")
         print("=" * 70)
-        checkpoint = torch.load(args.model_path, map_location=config.device)
-        eval_config = Config.from_dict(checkpoint['config'])
+        checkpoint = torch.load(args.model_path, map_location=config.device, weights_only=False)
+        eval_config = checkpoint['config']
         eval_config.device = config.device
         model = create_model(eval_config)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -240,12 +327,18 @@ def main():
         trainer = FatigueTrainer(model, eval_config)
         trainer.history = checkpoint.get('history', trainer.history)
         trainer.best_metric = checkpoint.get('best_metric', trainer.best_metric)
-        test_dataset = SEEDVIGDataset(eval_config, subject_ids=args.subject_ids, mode='val')
-        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=eval_config.batch_size, shuffle=False, num_workers=4)
+
+        # 注意：这里并没有传入scaler，因此测试集将自己标准化，可能与训练时分布不一致。
+        # 建议用户使用与训练时相同的被试划分，并参照训练部分传递scaler，这里作为简单示例
+        test_ids = args.subject_ids if args.subject_ids else [21, 22, 23]
+        test_dataset = SEEDVIGDataset(eval_config, subject_ids=test_ids, mode='val', transform=None)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=eval_config.batch_size,
+                                                  shuffle=False, num_workers=0)
         test_metrics = trainer.evaluate(test_loader)
         print(f"\n测试集性能:")
         for key, value in test_metrics.items():
-            print(f"  {key}: {value:.4f}")
+            if isinstance(value, float):
+                print(f"  {key}: {value:.4f}")
 
     print("\n" + "=" * 70)
     print("程序执行完成！")

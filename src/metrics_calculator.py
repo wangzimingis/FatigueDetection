@@ -133,7 +133,7 @@ class FatigueMetricsCalculator:
         print(f"\n各类别性能指标:")
         print(f"  {'类别':<10} {'精确率':<10} {'召回率':<10} {'F1分数':<10} {'灵敏度':<10} {'特异性':<10}")
         print("-" * 70)
-        classes = ['清醒', '轻度疲劳', '重度疲劳']
+        classes = ['非疲劳', '轻度疲劳', '重度疲劳']
         cmw = res['class_wise_metrics']
         for i, cls in enumerate(classes):
             print(f"  {cls:<10} "
@@ -149,7 +149,7 @@ class FatigueMetricsCalculator:
 
         print(f"\n混淆矩阵:")
         cm = np.array(res['confusion_matrix'])
-        print(f"  {cm[0][0]:4d} {cm[0][1]:4d} {cm[0][2]:4d}  | 清醒")
+        print(f"  {cm[0][0]:4d} {cm[0][1]:4d} {cm[0][2]:4d}  | 非疲劳")
         print(f"  {cm[1][0]:4d} {cm[1][1]:4d} {cm[1][2]:4d}  | 轻度疲劳")
         print(f"  {cm[2][0]:4d} {cm[2][1]:4d} {cm[2][2]:4d}  | 重度疲劳")
         print("=" * 70)

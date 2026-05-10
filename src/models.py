@@ -217,7 +217,7 @@ class EEGLSTM(nn.Module):
             input_size=64,
             hidden_size=config.lstm_hidden,
             num_layers=config.lstm_layers,
-            bidirectional=config.lstm_bidirectional,
+            bidirectional=config.lstm_bidirectional,             # 关闭双向，减少参数 bidirectional=config.False,
             batch_first=True,
             dropout=config.dropout_rate if config.lstm_layers > 1 else 0
         )
@@ -575,73 +575,52 @@ class HyperLSTMCell(nn.Module):
         return new_h, (new_h, new_c), new_hyper_state
 
 class EEGTransformer(nn.Module):
-    """EEG Transformer特征提取器 - 修复版本"""
+    """EEG Transformer 特征提取器 — 轻量化版"""
 
     def __init__(self, config):
         super().__init__()
         self.config = config
 
-        # 根据特征类型确定特征维度
-        if config.feature_type == '2Hz':
-            feature_dim = config.frequency_bands
-        else:
-            feature_dim = config.five_bands
+        feature_dim = config.frequency_bands if config.feature_type == '2Hz' else config.five_bands
 
-        # 输入投影层
-        self.input_projection = nn.Linear(feature_dim, config.transformer_dim)
+        # 减小模型维度
+        self.d_model = 128               # 原 256 → 128
+        self.nhead = 4                   # 原 8 → 4
+        self.num_layers = 2              # 原 4 → 2
+        self.dim_feedforward = 256       # 原 512 → 256
+        self.dropout = 0.5               # 增大 Dropout
 
-        # 位置编码
-        self.pos_encoder = PositionalEncoding(config.transformer_dim)
+        self.input_projection = nn.Linear(feature_dim, self.d_model)
+        self.pos_encoder = PositionalEncoding(self.d_model)
 
-        # 创建Transformer编码器层
-        encoder_layers = nn.TransformerEncoderLayer(
-            d_model=config.transformer_dim,
-            nhead=config.transformer_heads,
-            dim_feedforward=config.transformer_ff_dim,
-            dropout=config.dropout_rate,
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=self.nhead,
+            dim_feedforward=self.dim_feedforward,
+            dropout=self.dropout,
             batch_first=True,
             activation='relu'
         )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layers)
 
-        # 创建Transformer编码器
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layers,
-            num_layers=config.transformer_layers
-        )
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.d_model))
 
-        # 分类token
-        self.cls_token = nn.Parameter(torch.randn(1, 1, config.transformer_dim))
+        self.output_norm = nn.LayerNorm(self.d_model)
+        self.dropout = nn.Dropout(self.dropout)
 
-        # 输出层
-        self.output_norm = nn.LayerNorm(config.transformer_dim)
-        self.dropout = nn.Dropout(config.dropout_rate)
-
-        self.output_dim = config.transformer_dim
+        self.output_dim = self.d_model
 
     def forward(self, x):
         # x: (batch, channels, features)
         batch_size = x.size(0)
-
-        # 投影到transformer维度
-        x = self.input_projection(x)  # (batch, channels, transformer_dim)
-
-        # 添加分类token
+        x = self.input_projection(x)                     # (batch, channels, d_model)
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)  # (batch, channels+1, transformer_dim)
-
-        # 位置编码
+        x = torch.cat((cls_tokens, x), dim=1)           # (batch, channels+1, d_model)
         x = self.pos_encoder(x)
-
-        # Transformer编码
         x = self.transformer_encoder(x)
-
-        # 取分类token的输出
-        x = x[:, 0, :]  # (batch, transformer_dim)
-
-        # 层归一化和dropout
+        x = x[:, 0, :]                                   # 取 CLS token
         x = self.output_norm(x)
         x = self.dropout(x)
-
         return x
 
 
