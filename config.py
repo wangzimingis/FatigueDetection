@@ -42,7 +42,7 @@ class Config:
 
     # 阈值配置（用于将回归转为分类）
     regression_thresholds: Dict[str, float] = field(
-        default_factory=lambda: {'alert': 0.3, 'mild': 0.6, 'severe': 1.0}
+        default_factory=lambda: {'alert': 0.35, 'mild': 0.7, 'severe': 1.0}
     )
 
     # 深度学习模型配置
@@ -70,6 +70,8 @@ class Config:
     hyper_hidden_size: int = 64  # 超网络隐藏层维度
     hyper_embedding_size: int = 16  # 超网络嵌入维度
     use_layer_norm: bool = True  # 是否在 HyperLSTM 中使用层归一化
+    #macnn配置
+    macnn_channels: List[int] = field(default_factory=lambda: [64, 128, 256])
 
     # 多模态融合
     fusion_method: str = 'concatenate'  # 'concatenate', 'attention', 'cross_attention'

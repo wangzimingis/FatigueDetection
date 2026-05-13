@@ -22,7 +22,6 @@ import torch.nn.functional as F
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple, Any
 import pandas as pd
-import config
 
 try:
     from src.utils import _chinese_font_available
@@ -61,7 +60,7 @@ class FocalLoss(nn.Module):
 
 
 class FatigueTrainer:
-    """疲劳检测模型训练器 - 优化版"""
+    """疲劳检测模型训练器 - 优化版（支持余弦退火）"""
 
     def __init__(self, model: nn.Module, config: Config, device: Optional[torch.device] = None):
         self.model = model
@@ -83,7 +82,6 @@ class FatigueTrainer:
         # 2. 损失函数
         class_weights = self._compute_class_weights_from_dataloader()
         if self.task_type == 'classification':
-            # 如果无法计算权重，使用全1占位，稍后会在 train 方法中更新
             if class_weights is None:
                 class_weights = torch.ones(config.num_classes, device=self.device)
             self.criterion = FocalLoss(weight=class_weights, gamma=2)
@@ -98,15 +96,21 @@ class FatigueTrainer:
             betas=(0.9, 0.999)
         )
 
-        # 4. 学习率调度器
-        if self.task_type == 'classification':
-            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode='max', factor=0.5, patience=10, verbose=True
+        # 4. 学习率调度器 —— 根据配置选择
+        scheduler_type = getattr(config, 'scheduler_type', 'plateau')
+        if scheduler_type == 'cosine':
+            self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer, T_0=10, T_mult=2, eta_min=1e-6
             )
         else:
-            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode='min', factor=0.5, patience=10, verbose=True
-            )
+            if self.task_type == 'classification':
+                self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    self.optimizer, mode='max', factor=0.5, patience=config.patience, verbose=True
+                )
+            else:
+                self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    self.optimizer, mode='min', factor=0.5, patience=config.patience, verbose=True
+                )
 
         self.scaler = GradScaler(enabled=config.use_mixed_precision)
         self.writer = SummaryWriter(log_dir=config.log_dir)
@@ -127,6 +131,7 @@ class FatigueTrainer:
 
         print(f"训练器初始化完成 | 设备: {self.device} | 混合精度: {config.use_mixed_precision}")
         print(f"任务类型: {'分类' if self.task_type == 'classification' else '回归'}")
+        print(f"调度器: {scheduler_type}")
 
     def _compute_class_weights_from_dataloader(self) -> Optional[torch.Tensor]:
         """从训练数据加载器计算类别权重"""
@@ -147,6 +152,7 @@ class FatigueTrainer:
 
         class_weights = 1.0 / counts
         class_weights = class_weights / class_weights.sum() * len(unique)
+        # 可在此对轻度疲劳（index=1）增加权重，如：class_weights[1] *= 1.5
         weights_tensor = torch.FloatTensor(class_weights).to(self.device)
         print(f"类别权重: {dict(zip(unique, class_weights))}")
         return weights_tensor
@@ -364,10 +370,10 @@ class FatigueTrainer:
             num_epochs = self.config.epochs
 
         self._train_loader_for_weights = train_loader
+        # 开始训练前更新权重（若FocalLoss支持）
         if self.task_type == 'classification':
             weights = self._compute_class_weights_from_dataloader()
-            if weights is not None:
-                # 更新 FocalLoss 的类别权重
+            if weights is not None and hasattr(self.criterion, 'weight'):
                 self.criterion.weight.copy_(weights)
 
         print(f"\n开始训练，共 {num_epochs} 个 epochs")
@@ -386,7 +392,12 @@ class FatigueTrainer:
             self.history['val_loss'].append(val_loss)
             self.history['val_metrics'].append(val_metrics)
 
-            self.scheduler.step(val_metrics['main_metric'])
+            # 根据调度器类型更新学习率
+            scheduler_type = getattr(self.config, 'scheduler_type', 'plateau')
+            if scheduler_type == 'cosine':
+                self.scheduler.step()  # 余弦退火不需要指标
+            else:
+                self.scheduler.step(val_metrics['main_metric'])
 
             self._print_metrics(train_loss, train_metrics, val_loss, val_metrics)
 

@@ -63,8 +63,10 @@ def parse_arguments():
                         help='可视化特征')
 
     # 模型参数
+    # 模型参数
     parser.add_argument('--model_type', type=str, default='multimodal_transformer',
-                        choices=['cnn', 'multimodal_cnn_lstm', 'multimodal_transformer', 'hyperlstm'],
+                        choices=['cnn', 'multimodal_cnn_lstm', 'multimodal_transformer',
+                                 'hyperlstm', 'macnn', 'mlp', 'lightcnn'],
                         help='模型类型')
     parser.add_argument('--fusion_method', type=str, default='cross_attention',
                         choices=['concatenate', 'attention', 'cross_attention'],
@@ -83,6 +85,17 @@ def parse_arguments():
                         help='批大小')
     parser.add_argument('--learning_rate', type=float, default=1e-3,
                         help='学习率')
+
+    # 新增：关键正则化参数
+    parser.add_argument('--dropout_rate', type=float, default=None,
+                        help='Dropout 比率 (None 时使用模型默认值)')
+    parser.add_argument('--weight_decay', type=float, default=None,
+                        help='权重衰减 (None 时使用模型默认值)')
+    parser.add_argument('--patience', type=int, default=None,
+                        help='早停耐心 (None 时使用模型默认值)')
+    parser.add_argument('--scheduler', type=str, default='plateau',
+                        choices=['plateau', 'cosine'],
+                        help='学习率调度器类型')
 
     # 评估参数
     parser.add_argument('--evaluate', action='store_true',
@@ -125,6 +138,35 @@ def setup_experiment(args):
     config.learning_rate = args.learning_rate
     config.seed = args.seed
 
+    # 覆盖可能由命令行指定的正则化参数
+    if args.dropout_rate is not None:
+        config.dropout_rate = args.dropout_rate
+    if args.weight_decay is not None:
+        config.weight_decay = args.weight_decay
+    if args.patience is not None:
+        config.patience = args.patience
+
+    # 若使用 MACNN，自动设置推荐的超参数（除非用户明确指定）
+    if config.model_type == 'macnn':
+        # 推荐配置
+        if args.dropout_rate is None:
+            config.dropout_rate = 0.5
+        if args.weight_decay is None:
+            config.weight_decay = 1e-3
+        if args.patience is None:
+            config.patience = 30
+        if args.epochs == 150:   # 默认值150，可以适当延长
+            config.epochs = 200
+        if args.learning_rate == 1e-3:
+            config.learning_rate = 5e-4
+        # 如果未指定调度器，则使用余弦退火
+        if args.scheduler == 'plateau':
+            config.scheduler_type = 'cosine'
+
+    # 保存调度器类型到 config 对象（需在 Config 类中添加属性，如不存在则动态添加）
+    if not hasattr(config, 'scheduler_type'):
+        setattr(config, 'scheduler_type', args.scheduler)
+
     if args.debug:
         config.epochs = 5
         config.batch_size = 16
@@ -154,6 +196,8 @@ def setup_experiment(args):
     print(f"特征类型: {config.feature_type}")
     print(f"使用EOG: {config.use_eog}")
     print(f"多模态融合: {config.use_multimodal}")
+    print(f"Dropout: {config.dropout_rate}  Weight Decay: {config.weight_decay}  Patience: {config.patience}")
+    print(f"调度器: {config.scheduler_type}")
 
     return config
 
@@ -204,7 +248,7 @@ def main():
         else:
             # ========== 固定被试划分方案 ==========
             train_ids = [1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20]  # 17个实验，训练
-            val_ids = [5,16, 19]  # 3个实验，验证20-5
+            val_ids = [5, 16, 19]   # 3个实验，验证
             test_ids = [21, 22, 23]  # 3个实验，测试
 
             # 关键：禁用归一化，否则验证集/测试集会独立计算 min-max，破坏分布一致性
@@ -217,7 +261,7 @@ def main():
             train_dataset = SEEDVIGDataset(config, subject_ids=train_ids, mode='train',
                                            transform=train_transform)
 
-            # 显式取出训练集拟合好的 scaler，确保后续验证集/测试集使用相同的缩放参数
+            # 显式取出训练集拟合好的 scaler
             train_eeg_scaler = train_dataset.eeg_scaler
             train_eog_scaler = train_dataset.eog_scaler
             if train_eeg_scaler is None:
@@ -275,14 +319,13 @@ def main():
             model = create_model(config)
             plot_model_architecture(model, config, save_path=f"{config.figure_dir}/model_architecture.png")
 
-            # 训练
+            # 训练（传递调度器类型）
             trainer = FatigueTrainer(model, config)
             best_metric = trainer.train(train_loader, val_loader)
             print(f"\n训练完成！最佳验证指标: {best_metric:.4f}")
 
-            # 保存最终模型（同时保存 Scaler，方便独立评估）
+            # 保存最终模型及 scaler
             trainer.save_checkpoint('final_model.pth')
-            # 可选：将 scaler 也保存到单独的 checkpoint 中
             torch.save({'eeg_scaler': train_eeg_scaler, 'eog_scaler': train_eog_scaler},
                        os.path.join(config.save_dir, 'scalers.pth'))
 
@@ -328,8 +371,6 @@ def main():
         trainer.history = checkpoint.get('history', trainer.history)
         trainer.best_metric = checkpoint.get('best_metric', trainer.best_metric)
 
-        # 注意：这里并没有传入scaler，因此测试集将自己标准化，可能与训练时分布不一致。
-        # 建议用户使用与训练时相同的被试划分，并参照训练部分传递scaler，这里作为简单示例
         test_ids = args.subject_ids if args.subject_ids else [21, 22, 23]
         test_dataset = SEEDVIGDataset(eval_config, subject_ids=test_ids, mode='val', transform=None)
         test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=eval_config.batch_size,
